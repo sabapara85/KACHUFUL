@@ -174,7 +174,11 @@ def bcast(g):
         socketio.emit('state',g.snap(p['sid']),room=p['sid'])
 
 def bcast_all(g):
-    socketio.emit('state',g.snap(),room=g.code)
+    # Send personalised state to each player so everyone gets correct me.is_host etc
+    for p in g.players:
+        socketio.emit('state', g.snap(p['sid']), room=p['sid'])
+    # Also broadcast to room for any listeners
+    socketio.emit('state', g.snap(), room=g.code)
 
 @socketio.on('create')
 def on_create(d):
@@ -195,7 +199,10 @@ def on_join(d):
         emit('err',{'msg':f'Name "{name}" taken'}); return
     g.add_player(request.sid,name); join_room(code); join_room(request.sid)
     emit('joined',{'code':code,'you':name})
-    bcast_all(g)
+    # Notify every existing player individually (especially host)
+    for p in g.players:
+        socketio.emit('state', g.snap(p['sid']), room=p['sid'])
+    socketio.emit('player_joined', {'name':name,'count':g.N()}, room=g.code)
 
 @socketio.on('set_decks')
 def on_decks(d):
