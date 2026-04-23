@@ -581,6 +581,13 @@ window.onload = () => {
   S.socket.on('round_end',    onRoundEnd);
   S.socket.on('game_over',    onGameOver);
   S.socket.on('chat_msg',   onChatMsg);
+  // Auto-reconnect: when socket reconnects after drop, restore player SID
+  S.socket.on('connect', () => {
+    if (S.myName && S.myCode) {
+      // Already in a game — reconnect to restore SID
+      S.socket.emit('reconnect_player', {code: S.myCode, name: S.myName});
+    }
+  });
   S.socket.on('player_joined', d => {
     toast(`${d.name} joined! (${d.count} players)`, 'success');
   });
@@ -943,11 +950,11 @@ function doStart() {
 }
 
 function doBid(amt) {
-  S.socket.emit('bid', {code:S.myCode, amount:amt});
+  S.socket.emit('bid', {code:S.myCode, amount:amt, name:S.myName});
 }
 
 function doPlay(idx) {
-  S.socket.emit('play', {code:S.myCode, card_idx:idx});
+  S.socket.emit('play', {code:S.myCode, card_idx:idx, name:S.myName});
 }
 
 function doNextRound() {
@@ -1003,7 +1010,7 @@ function sendChat() {
   const inp = document.getElementById('chatInput');
   const msg = inp.value.trim();
   if (!msg || !S.myCode) return;
-  S.socket.emit('chat_msg', {code: S.myCode, msg});
+  S.socket.emit('chat_msg', {code: S.myCode, msg, name: S.myName});
   inp.value = '';
 }
 
