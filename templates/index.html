@@ -581,6 +581,9 @@ window.onload = () => {
   S.socket.on('round_end',    onRoundEnd);
   S.socket.on('game_over',    onGameOver);
   S.socket.on('chat_msg',   onChatMsg);
+  S.socket.on('player_joined', d => {
+    toast(`${d.name} joined! (${d.count} players)`, 'success');
+  });
 };
 
 function buildFanCards() {
