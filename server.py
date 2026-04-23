@@ -1,0 +1,303 @@
+import os
+
+# Use gevent on Render (production), eventlet locally
+if os.environ.get('RENDER'):
+    from gevent import monkey
+    monkey.patch_all()
+else:
+    import eventlet
+    eventlet.monkey_patch()
+
+from flask import Flask, render_template, request
+from flask_socketio import SocketIO, emit, join_room
+import random, string
+
+app = Flask(__name__)
+app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'kachuful-2024-secret')
+
+async_mode = 'gevent' if os.environ.get('RENDER') else 'eventlet'
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode=async_mode)
+
+SUITS     = ['S','D','C','H']
+SUIT_SYM  = {'S':'♠','D':'♦','C':'♣','H':'♥'}
+SUIT_NAME = {'S':'Spades','D':'Diamonds','C':'Clubs','H':'Hearts'}
+SUIT_COL  = {'S':'black','D':'red','C':'black','H':'red'}
+RANKS     = ['2','3','4','5','6','7','8','9','10','J','Q','K','A']
+RANK_VAL  = {r:i for i,r in enumerate(RANKS)}
+TRUMP_CYC = ['S','D','C','H']
+
+def build_deck(nd):
+    return [{'rank':r,'suit':s} for _ in range(nd) for s in SUITS for r in RANKS]
+
+def balance_deck(nd, np_):
+    deck = build_deck(nd)
+    removal = [{'rank':r,'suit':s} for r in ['2','3','4','5','6'] for s in SUITS for _ in range(nd)]
+    while len(deck) % np_ != 0:
+        c = removal.pop(0)
+        deck.remove(c)
+    random.shuffle(deck)
+    return deck, len(deck)//np_
+
+def round_seq(mx):
+    return list(range(1,mx+1)) + list(range(mx-1,0,-1))
+
+def beats(c, w, led, trump):
+    cs,ws = c['suit'],w['suit']
+    # same_card: exact duplicate — same rank AND same suit (only possible with 2+ decks)
+    # Rule: later throw of identical card beats the earlier one
+    same_card = (c['rank']==w['rank'] and cs==ws)
+    if cs==trump and ws!=trump: return True
+    if cs==trump and ws==trump: return RANK_VAL[c['rank']]>RANK_VAL[w['rank']] or same_card
+    if cs==led   and ws!=trump: return RANK_VAL[c['rank']]>RANK_VAL[w['rank']] or same_card
+    return False
+
+games = {}
+
+def gcode():
+    c=''.join(random.choices(string.ascii_uppercase,k=5))
+    return c if c not in games else gcode()
+
+class Game:
+    def __init__(self,code,hsid,hname):
+        self.code=code; self.host_sid=hsid; self.status='lobby'
+        self.num_decks=2; self.players=[]; self.rseq=[]; self.ridx=0
+        self.didx=0; self.cidx=0; self.trump=None; self.trick=[]
+        self.tlead=0; self.history=[]; self.maxc=0
+        self.add_player(hsid,hname,True)
+
+    def add_player(self,sid,name,host=False):
+        self.players.append({'sid':sid,'name':name,'is_host':host,
+            'score':0,'bid':None,'won':0,'cards':[],'connected':True})
+
+    def P(self,sid): return next((p for p in self.players if p['sid']==sid),None)
+    def I(self,sid): return next((i for i,p in enumerate(self.players) if p['sid']==sid),-1)
+    def N(self): return len(self.players)
+
+    def start(self):
+        deck,self.maxc = balance_deck(self.num_decks,self.N())
+        self.rseq=round_seq(self.maxc); self.ridx=0; self.didx=0
+        for p in self.players: p['score']=0
+        self._deal(deck)
+
+    def _deal(self,deck=None):
+        nc=self.rseq[self.ridx]; self.trump=TRUMP_CYC[self.ridx%4]
+        self.trick=[]
+        for p in self.players: p['bid']=None; p['won']=0; p['cards']=[]
+        if deck is None:
+            deck,_=balance_deck(self.num_decks,self.N())
+        for i,p in enumerate(self.players): p['cards']=deck[i*nc:(i+1)*nc]
+        self.tlead=(self.didx+1)%self.N(); self.cidx=self.tlead
+        self.status='bidding'
+
+    def advance(self):
+        self.ridx+=1; self.didx=(self.didx+1)%self.N(); self._deal()
+
+    def bid(self,sid,amt):
+        p=self.P(sid); pi=self.I(sid)
+        if not p or pi!=self.cidx or p['bid'] is not None: return False,"Not your turn"
+        nc=self.rseq[self.ridx]
+        if amt<0 or amt>nc: return False,"Invalid bid"
+        if pi==self.didx:
+            others=sum(x['bid'] for x in self.players if x['bid'] is not None)
+            if others+amt==nc: return False,f"Hook rule: cannot bid {amt}"
+        p['bid']=amt; self.cidx=(self.cidx+1)%self.N()
+        if all(x['bid'] is not None for x in self.players):
+            self.status='playing'; self.cidx=self.tlead
+        return True,"ok"
+
+    def play(self,sid,ci):
+        p=self.P(sid); pi=self.I(sid)
+        if not p or pi!=self.cidx: return False,"Not your turn"
+        if ci<0 or ci>=len(p['cards']): return False,"Invalid card"
+        card=p['cards'][ci]
+        if self.trick:
+            led=self.trick[0]['card']['suit']
+            if any(c['suit']==led for c in p['cards']) and card['suit']!=led:
+                return False,f"Must follow {SUIT_SYM[led]}"
+        p['cards'].pop(ci)
+        self.trick.append({'sid':sid,'name':p['name'],'card':card})
+        self.cidx=(self.cidx+1)%self.N()
+        return True,('trick_done' if len(self.trick)==self.N() else 'ok')
+
+    def resolve(self):
+        led=self.trick[0]['card']['suit']; w=self.trick[0]
+        for e in self.trick[1:]:
+            if beats(e['card'],w['card'],led,self.trump): w=e
+        wp=self.P(w['sid']); wp['won']+=1
+        wi=self.I(w['sid']); self.tlead=wi; self.cidx=wi
+        t=self.trick[:]; self.trick=[]; return w['sid'],w['name'],t
+
+    def done(self): return all(len(p['cards'])==0 for p in self.players)
+    def last(self): return self.ridx>=len(self.rseq)-1
+
+    def score(self):
+        nc=self.rseq[self.ridx]; res=[]
+        for p in self.players:
+            pts=(10 if p['bid']==0 else 20+p['bid']) if p['bid']==p['won'] else 0
+            p['score']+=pts
+            res.append({'name':p['name'],'bid':p['bid'],'won':p['won'],'pts':pts,'total':p['score']})
+        self.history.append({'round':self.ridx+1,'cards':nc,'trump':self.trump,'scores':res})
+        self.status='round_end'; return res
+
+    def final(self):
+        return sorted([{'name':p['name'],'score':p['score']} for p in self.players],key=lambda x:-x['score'])
+
+    def forbidden(self):
+        if self.status!='bidding' or self.cidx!=self.didx: return None
+        nc=self.rseq[self.ridx]
+        others=sum(x['bid'] for x in self.players if x['bid'] is not None)
+        fb=nc-others
+        return fb if 0<=fb<=nc else None
+
+    def snap(self,fsid=None):
+        nc=self.rseq[self.ridx] if self.rseq else 0
+        ps=[]
+        for p in self.players:
+            pd={'sid':p['sid'],'name':p['name'],'score':p['score'],
+                'bid':p['bid'],'won':p['won'],'card_count':len(p['cards']),
+                'is_host':p['is_host'],'connected':p['connected']}
+            if fsid and p['sid']==fsid: pd['cards']=p['cards']
+            ps.append(pd)
+        return {'code':self.code,'status':self.status,'num_decks':self.num_decks,
+                'ridx':self.ridx,'rseq':self.rseq,'cur_cards':nc,
+                'trump':self.trump,'trump_sym':SUIT_SYM.get(self.trump,''),
+                'trump_name':SUIT_NAME.get(self.trump,''),
+                'trump_col':SUIT_COL.get(self.trump,'black'),
+                'cidx':self.cidx,'cur_name':self.players[self.cidx]['name'] if self.players else '',
+                'didx':self.didx,'dealer_name':self.players[self.didx]['name'] if self.status!='lobby' and self.players else '',
+                'trick':self.trick,'players':ps,'history':self.history,
+                'forbidden':self.forbidden(),'maxc':self.maxc,
+                'total_rounds':len(self.rseq)}
+
+def bcast(g):
+    for p in g.players:
+        socketio.emit('state',g.snap(p['sid']),room=p['sid'])
+
+def bcast_all(g):
+    socketio.emit('state',g.snap(),room=g.code)
+
+@socketio.on('create')
+def on_create(d):
+    name=d.get('name','Host').strip()[:20]
+    code=gcode(); g=Game(code,request.sid,name)
+    games[code]=g; join_room(code); join_room(request.sid)
+    emit('joined',{'code':code,'you':name})
+    emit('state',g.snap(request.sid))
+
+@socketio.on('join')
+def on_join(d):
+    name=d.get('name','').strip()[:20]; code=d.get('code','').upper().strip()
+    if code not in games: emit('err',{'msg':f'Room "{code}" not found'}); return
+    g=games[code]
+    if g.status!='lobby': emit('err',{'msg':'Game already started'}); return
+    if g.N()>=15: emit('err',{'msg':'Room full (15 max)'}); return
+    if any(p['name'].lower()==name.lower() for p in g.players):
+        emit('err',{'msg':f'Name "{name}" taken'}); return
+    g.add_player(request.sid,name); join_room(code); join_room(request.sid)
+    emit('joined',{'code':code,'you':name})
+    bcast_all(g)
+
+@socketio.on('set_decks')
+def on_decks(d):
+    code=d.get('code')
+    if code not in games: return
+    g=games[code]
+    if request.sid!=g.host_sid: return
+    g.num_decks=max(1,min(3,int(d.get('decks',2))))
+    bcast_all(g)
+
+@socketio.on('start')
+def on_start(d):
+    code=d.get('code')
+    if code not in games: emit('err',{'msg':'Room not found'}); return
+    g=games[code]
+    if request.sid!=g.host_sid: emit('err',{'msg':'Only host can start'}); return
+    if g.N()<2: emit('err',{'msg':'Need at least 2 players'}); return
+    g.start(); bcast(g)
+    socketio.emit('toast',{'msg':f'Game on! Round 1 — {g.rseq[0]} card. Trump: {SUIT_SYM[g.trump]} {SUIT_NAME[g.trump]}','t':'info'},room=g.code)
+
+@socketio.on('bid')
+def on_bid(d):
+    code=d.get('code'); amt=d.get('amount')
+    if code not in games: return
+    g=games[code]
+    if not isinstance(amt,int): emit('err',{'msg':'Invalid bid'}); return
+    ok,msg=g.bid(request.sid,amt)
+    if not ok: emit('err',{'msg':msg}); return
+    if g.status=='playing':
+        socketio.emit('toast',{'msg':f'All bids in! {g.players[g.tlead]["name"]} leads first.','t':'success'},room=g.code)
+    bcast(g)
+
+@socketio.on('play')
+def on_play(d):
+    code=d.get('code'); ci=d.get('card_idx')
+    if code not in games: return
+    g=games[code]
+    ok,msg=g.play(request.sid,ci)
+    if not ok: emit('err',{'msg':msg}); return
+    if msg=='trick_done':
+        wsid,wname,trick=g.resolve()
+        socketio.emit('trick_result',{'winner':wname,'trick':trick},room=g.code)
+        if os.environ.get('RENDER'):
+            from gevent import sleep as gsleep; gsleep(2.5)
+        else:
+            eventlet.sleep(2.5)
+        if g.done():
+            res=g.score()
+            bcast(g)
+            if g.last(): socketio.emit('game_over',{'final':g.final()},room=g.code)
+            else: socketio.emit('round_end',{'result':res,'round':g.ridx+1},room=g.code)
+        else: bcast(g)
+    else: bcast(g)
+
+@socketio.on('next_round')
+def on_next(d):
+    code=d.get('code')
+    if code not in games: return
+    g=games[code]
+    if request.sid!=g.host_sid: return
+    if g.last(): socketio.emit('game_over',{'final':g.final()},room=g.code); return
+    g.advance(); bcast(g)
+    nc=g.rseq[g.ridx]
+    socketio.emit('toast',{'msg':f'Round {g.ridx+1} — {nc} card(s). Trump: {SUIT_SYM[g.trump]} {SUIT_NAME[g.trump]}','t':'info'},room=g.code)
+
+@socketio.on('reconnect_player')
+def on_reconnect(d):
+    code=d.get('code'); name=d.get('name','')
+    if code not in games: emit('err',{'msg':'Room not found'}); return
+    g=games[code]
+    p=next((x for x in g.players if x['name'].lower()==name.lower()),None)
+    if not p: emit('err',{'msg':'Player not found'}); return
+    old=p['sid']; p['sid']=request.sid; p['connected']=True
+    if g.host_sid==old: g.host_sid=request.sid
+    join_room(code); join_room(request.sid)
+    emit('joined',{'code':code,'you':name,'reconnected':True})
+    emit('state',g.snap(request.sid))
+
+@socketio.on('chat_msg')
+def on_chat(d):
+    code=d.get('code'); msg=d.get('msg','').strip()[:200]
+    if not code or code not in games or not msg: return
+    g=games[code]; p=g.P(request.sid)
+    if not p: return
+    socketio.emit('chat_msg',{'name':p['name'],'msg':msg},room=code)
+
+@socketio.on('disconnect')
+def on_dc():
+    for code,g in games.items():
+        p=g.P(request.sid)
+        if p:
+            p['connected']=False
+            socketio.emit('toast',{'msg':f'{p["name"]} disconnected','t':'warn'},room=code)
+            bcast_all(g); break
+
+@app.route('/')
+def index(): return render_template('index.html')
+
+@app.route('/join/<code>')
+def joinlink(code): return render_template('index.html',join_code=code)
+
+if __name__=='__main__':
+    print("\n  KACHUFUL — Judgement of Cards")
+    print("  http://localhost:5000\n")
+    socketio.run(app,host='0.0.0.0',port=5000,debug=False)
