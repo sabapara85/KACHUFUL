@@ -229,6 +229,14 @@ def on_bid(d):
     if code not in games: return
     g=games[code]
     if not isinstance(amt,int): emit('err',{'msg':'Invalid bid'}); return
+    # If SID not in game, player may have reconnected with new SID — try to fix
+    if not g.P(request.sid):
+        name=d.get('name','')
+        p=next((x for x in g.players if x['name'].lower()==name.lower()),None)
+        if p:
+            old=p['sid']; p['sid']=request.sid
+            if g.host_sid==old: g.host_sid=request.sid
+            join_room(code); join_room(request.sid)
     ok,msg=g.bid(request.sid,amt)
     if not ok: emit('err',{'msg':msg}); return
     if g.status=='playing':
@@ -240,6 +248,14 @@ def on_play(d):
     code=d.get('code'); ci=d.get('card_idx')
     if code not in games: return
     g=games[code]
+    # If SID not in game, player may have reconnected with new SID — fix silently
+    if not g.P(request.sid):
+        name=d.get('name','')
+        p=next((x for x in g.players if x['name'].lower()==name.lower()),None)
+        if p:
+            old=p['sid']; p['sid']=request.sid
+            if g.host_sid==old: g.host_sid=request.sid
+            join_room(code); join_room(request.sid)
     ok,msg=g.play(request.sid,ci)
     if not ok: emit('err',{'msg':msg}); return
     if msg=='trick_done':
@@ -291,12 +307,28 @@ def on_chat(d):
 
 @socketio.on('disconnect')
 def on_dc():
+    sid = request.sid
+    def delayed_disconnect():
+        # Wait 6 seconds — if player reconnected with new SID, their old SID
+        # will still be in players but connected=True (updated by reconnect)
+        # Only mark disconnected if SID still matches (no reconnect happened)
+        if os.environ.get('RENDER'):
+            from gevent import sleep as gsleep; gsleep(6)
+        else:
+            eventlet.sleep(6)
+        for code,g in games.items():
+            p=g.P(sid)
+            if p and not p['connected']:
+                socketio.emit('toast',{'msg':f'{p["name"]} disconnected','t':'warn'},room=code)
+                bcast_all(g)
+                break
     for code,g in games.items():
-        p=g.P(request.sid)
+        p=g.P(sid)
         if p:
             p['connected']=False
-            socketio.emit('toast',{'msg':f'{p["name"]} disconnected','t':'warn'},room=code)
-            bcast_all(g); break
+            # Spawn delayed check instead of immediate broadcast
+            socketio.start_background_task(delayed_disconnect)
+            break
 
 @app.route('/')
 def index(): return render_template('index.html')
