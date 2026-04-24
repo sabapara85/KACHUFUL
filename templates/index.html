@@ -420,6 +420,40 @@ body{background:var(--bg);color:var(--text);font-family:'Crimson Pro',serif;font
   </div>
 </div>
 
+
+<!-- ══════════ REJOIN ══════════ -->
+<div id="sRejoin" class="screen">
+  <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;
+    min-height:100vh;gap:20px;padding:24px;
+    background:radial-gradient(ellipse at 50% 40%,#1b5e3b 0%,#0d2818 70%);">
+    <div style="font-family:'Cinzel',serif;font-size:28px;color:#c9a84c;letter-spacing:4px;">
+      KACHUFUL
+    </div>
+    <div style="background:rgba(0,0,0,0.4);border:1px solid rgba(201,168,76,0.4);
+      border-radius:12px;padding:24px;width:100%;max-width:380px;text-align:center;">
+      <div style="font-size:32px;margin-bottom:12px;">🔄</div>
+      <div style="font-family:'Cinzel',serif;font-size:16px;color:#c9a84c;
+        letter-spacing:2px;margin-bottom:8px;">REJOIN GAME</div>
+      <div style="font-size:14px;color:rgba(240,230,200,0.7);margin-bottom:20px;"
+        id="rejoinMsg">Reconnecting to your game...</div>
+      <div style="font-family:'Cinzel',serif;font-size:20px;color:#e8c97a;
+        margin-bottom:6px;" id="rejoinName"></div>
+      <div style="font-size:13px;color:rgba(201,168,76,0.6);
+        margin-bottom:20px;" id="rejoinCode"></div>
+      <button class="btn full" onclick="doRejoin()" id="rejoinBtn">
+        Rejoin Game
+      </button>
+      <button class="btn ghost full" onclick="startFresh()"
+        style="margin-top:10px;">
+        Start Fresh (New Game)
+      </button>
+    </div>
+    <div style="font-size:10px;color:rgba(201,168,76,0.2);letter-spacing:1px;">
+      © 2025 VIRAL PATEL
+    </div>
+  </div>
+</div>
+
 <!-- ══════════ LOBBY ══════════ -->
 <div id="sLobby" class="screen">
   <div class="lobby-header">
@@ -575,7 +609,7 @@ window.onload = () => {
   S.socket = io();
   S.socket.on('joined',   onJoined);
   S.socket.on('state',    onState);
-  S.socket.on('err',      d => toast(d.msg,'err'));
+  S.socket.on('err',           onErr);
   S.socket.on('toast',    d => toast(d.msg, d.t||'info'));
   S.socket.on('trick_result', onTrickResult);
   S.socket.on('round_end',    onRoundEnd);
@@ -583,9 +617,19 @@ window.onload = () => {
   S.socket.on('chat_msg',   onChatMsg);
   // Auto-reconnect: when socket reconnects after drop, restore player SID
   S.socket.on('connect', () => {
+    if (!S.myName) S.myName = localStorage.getItem('kf_name') || sessionStorage.getItem('kf_name') || '';
+    if (!S.myCode) S.myCode = localStorage.getItem('kf_code') || sessionStorage.getItem('kf_code') || '';
     if (S.myName && S.myCode) {
-      // Already in a game — reconnect to restore SID
       S.socket.emit('reconnect_player', {code: S.myCode, name: S.myName});
+    }
+  });
+  S.socket.on('disconnect', () => {
+    if (S.myName && S.myCode) {
+      const el1 = document.getElementById('rejoinName');
+      const el2 = document.getElementById('rejoinCode');
+      if (el1) el1.textContent = S.myName;
+      if (el2) el2.textContent = 'Room: ' + S.myCode;
+      show('sRejoin');
     }
   });
   S.socket.on('player_joined', d => {
@@ -608,17 +652,68 @@ function buildFanCards() {
 // ── Socket handlers ────────────────────────────────────────────
 function onJoined(d) {
   S.myName = d.you; S.myCode = d.code;
+  // Save to BOTH localStorage (survives refresh) and sessionStorage
+  localStorage.setItem('kf_name', d.you);
+  localStorage.setItem('kf_code', d.code);
   sessionStorage.setItem('kf_name', d.you);
   sessionStorage.setItem('kf_code', d.code);
   document.getElementById('lobbyCode').textContent = d.code;
   show('sLobby');
-  if (d.reconnected) toast('Reconnected!','success');
+}
+
+function onRejoined(d) {
+  S.myName = d.you; S.myCode = d.code;
+  localStorage.setItem('kf_name', d.you);
+  localStorage.setItem('kf_code', d.code);
+  document.getElementById('lobbyCode').textContent = d.code;
+  toast('Welcome back ' + d.you + '!', 'success');
+  // State will follow immediately from server
+}
+
+function onErr(d) {
+  // Handle specific error codes
+  if (d.msg === 'no_game') {
+    // Game no longer exists — clear saved session
+    clearSession();
+    show('sLanding');
+    toast('Game session ended. Please start a new game.','warn');
+    return;
+  }
+  if (d.msg === 'no_player') {
+    clearSession();
+    show('sLanding');
+    toast('Player not found. Please join again.','warn');
+    return;
+  }
+  toast(d.msg,'err');
+}
+
+function clearSession() {
+  localStorage.removeItem('kf_name');
+  localStorage.removeItem('kf_code');
+  sessionStorage.removeItem('kf_name');
+  sessionStorage.removeItem('kf_code');
+  S.myName = ''; S.myCode = '';
+}
+
+function doRejoin() {
+  const name = localStorage.getItem('kf_name');
+  const code = localStorage.getItem('kf_code');
+  if (!name || !code) { show('sLanding'); return; }
+  document.getElementById('rejoinMsg').textContent = 'Reconnecting...';
+  document.getElementById('rejoinBtn').textContent = 'Connecting...';
+  S.socket.emit('reconnect_player', {code, name});
+}
+
+function startFresh() {
+  clearSession();
+  show('sLanding');
 }
 
 function onState(st) {
   S.state = st;
-  if (!S.myName) S.myName = sessionStorage.getItem('kf_name') || '';
-  if (!S.myCode) S.myCode = sessionStorage.getItem('kf_code') || '';
+  if (!S.myName) S.myName = localStorage.getItem('kf_name') || sessionStorage.getItem('kf_name') || '';
+  if (!S.myCode) S.myCode = localStorage.getItem('kf_code') || sessionStorage.getItem('kf_code') || '';
   const me = st.players.find(p => p.name === S.myName);
   S.isHost = me ? me.is_host : false;
   if (me && me.cards && me.cards.length > 0) S.myCards = me.cards;
@@ -642,6 +737,7 @@ function onTrickResult(d) {
 function onRoundEnd(d) { /* state will follow, showing scores screen */ }
 
 function onGameOver(d) {
+  clearSession();  // Game ended — clear saved session
   show('sFinal');
   const list = document.getElementById('finalList');
   list.innerHTML = '';
@@ -1143,11 +1239,23 @@ function notifyChat(msg) {
   addSystemMsg(msg);
 }
 
-// Handle join link (URL path)
+// Handle join link + returning player on refresh
 (()=>{
   const path = window.location.pathname;
   const m = path.match(/\/join\/([A-Z]{5})/i);
   if (m) document.getElementById('joinCode').value = m[1].toUpperCase();
+
+  // Returning player — show rejoin screen automatically on refresh
+  const savedName = localStorage.getItem('kf_name') || sessionStorage.getItem('kf_name');
+  const savedCode = localStorage.getItem('kf_code') || sessionStorage.getItem('kf_code');
+  if (savedName && savedCode) {
+    S.myName = savedName; S.myCode = savedCode;
+    const el1 = document.getElementById('rejoinName');
+    const el2 = document.getElementById('rejoinCode');
+    if (el1) el1.textContent = savedName;
+    if (el2) el2.textContent = 'Room: ' + savedCode;
+    show('sRejoin');
+  }
 })();
 </script>
 </body>
