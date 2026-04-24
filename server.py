@@ -1,4 +1,4 @@
-import os
+import os, json
 
 # Use gevent on Render (production), eventlet locally
 if os.environ.get('RENDER'):
@@ -52,6 +52,47 @@ def beats(c, w, led, trump):
     return False
 
 games = {}
+
+# ── Persistence ───────────────────────────────────────────────────
+SAVE_FILE = '/tmp/kachuful_games.json' if os.environ.get('RENDER') else 'kachuful_games.json'
+
+def save_games():
+    try:
+        data={}
+        for code,g in games.items():
+            data[code]={'code':g.code,'host_sid':g.host_sid,'status':g.status,
+                'num_decks':g.num_decks,'rseq':g.rseq,'ridx':g.ridx,
+                'didx':g.didx,'cidx':g.cidx,'trump':g.trump,
+                'trick':g.trick,'tlead':g.tlead,'history':g.history,'maxc':g.maxc,
+                'players':[{'sid':p['sid'],'name':p['name'],'is_host':p['is_host'],
+                    'score':p['score'],'bid':p['bid'],'won':p['won'],
+                    'cards':p['cards'],'connected':False} for p in g.players]}
+        with open(SAVE_FILE,'w') as f: json.dump(data,f)
+    except Exception as e: print(f'Save error: {e}')
+
+def load_games():
+    try:
+        if not os.path.exists(SAVE_FILE): return {}
+        with open(SAVE_FILE,'r') as f: data=json.load(f)
+        restored={}
+        for code,d in data.items():
+            if d['status'] in ('lobby','game_over'): continue
+            g=Game.__new__(Game)
+            g.code=d['code']; g.host_sid=d['host_sid']; g.status=d['status']
+            g.num_decks=d['num_decks']; g.rseq=d['rseq']; g.ridx=d['ridx']
+            g.didx=d['didx']; g.cidx=d['cidx']; g.trump=d['trump']
+            g.trick=d['trick']; g.tlead=d['tlead']; g.history=d['history']
+            g.maxc=d['maxc']; g.players=d['players']
+            restored[code]=g
+            print(f'Restored game {code} — {len(g.players)} players, round {g.ridx+1}')
+        return restored
+    except Exception as e: print(f'Load error: {e}'); return {}
+
+def init_games():
+    global games
+    games=load_games()
+    print(f'Loaded {len(games)} saved game(s) from disk')
+
 
 def gcode():
     c=''.join(random.choices(string.ascii_uppercase,k=5))
@@ -170,10 +211,12 @@ class Game:
                 'total_rounds':len(self.rseq)}
 
 def bcast(g):
+    save_games()
     for p in g.players:
         socketio.emit('state',g.snap(p['sid']),room=p['sid'])
 
 def bcast_all(g):
+    save_games()
     # Send personalised state to each player so everyone gets correct me.is_host etc
     for p in g.players:
         socketio.emit('state', g.snap(p['sid']), room=p['sid'])
@@ -294,8 +337,11 @@ def on_reconnect(d):
     old=p['sid']; p['sid']=request.sid; p['connected']=True
     if g.host_sid==old: g.host_sid=request.sid
     join_room(code); join_room(request.sid)
+    save_games()
     emit('joined',{'code':code,'you':name,'reconnected':True})
     emit('state',g.snap(request.sid))
+    socketio.emit('toast',{'msg':f'{name} rejoined!','t':'success'},room=code)
+    bcast_all(g)
 
 @socketio.on('chat_msg')
 def on_chat(d):
@@ -335,6 +381,9 @@ def index(): return render_template('index.html')
 
 @app.route('/join/<code>')
 def joinlink(code): return render_template('index.html',join_code=code)
+
+# Load saved games when server starts (handles Render restarts)
+init_games()
 
 if __name__=='__main__':
     print("\n  KACHUFUL — Judgement of Cards")
